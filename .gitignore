@@ -1,0 +1,49 @@
+# ======================
+# IGNORE FILES & FOLDERS
+# ======================
+
+# Videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Images (raw dataset)
+*.jpg
+*.jpeg
+*.png
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.weights
+
+# Dataset & model folders
+/input_videos/
+/output_videos/
+/dataset/
+/datasets/
+/models/
+/checkpoints/
+/runs/
+/data/*
+
+# Archives
+*.zip
+*.tar
+*.gz
+*.7z
+
+# Python cache & temp
+__pycache__/
+*.log
+*.tmp
+.DS_Store
+
+# Virtual environment
+.venv/
+
+# Data files
+*.npz
+*.jsonl
