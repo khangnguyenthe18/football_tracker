@@ -118,9 +118,22 @@ class MatchAnalytics:
         self._poss_candidate_streak = 0     # how many frames candidate leads
         self._poss_miss_count = 0           # frames since ball last seen
 
-        # ── Pass count ──
+        # ── Pass count tuning & state machine ──
+        self._PASS_MIN_CONTROL_FRAMES = 3   # consecutive frames to confirm passer/receiver control
+        self._PASS_MIN_DISTANCE = 35.0      # min pixel distance between passer & receiver
+        self._PASS_MAX_TRANSIT_FRAMES = 90  # max frames allowed for pass in transit
+
         self.pass_counts = {1: 0, 2: 0}
-        self._prev_pass_active = False  # rising-edge detection
+        self.last_ball_possessor_id = None
+        self.last_ball_possessor_team = None
+        self.last_pass_completed_frame = -100
+
+        self._pass_candidate_id = None
+        self._pass_candidate_frames = 0
+        self._passer_id = None
+        self._passer_team = None
+        self._passer_pos = None           # foot position (cx, cy)
+        self._passer_confirmed_frame = -100
 
         # ── Speed ──
         self._prev_feet = {}       # pid → (cal_x, cal_y)  calibrated
@@ -238,19 +251,98 @@ class MatchAnalytics:
         return {t: self.possession_frames[t] / total for t in (1, 2)}
 
     # ═══════ 2. PASS COUNT ═══════════════════════════════════════
-    def update_pass_count(self, frame_idx, tracks_frame, ball_action_spot):
-        pred_action = ball_action_spot.video_pred_actions[frame_idx]
-        pass_active = pred_action[0] > 0.5  # PASS class index = 0
+    def update_pass_count(self, frame_idx, tracks_frame, ball_action_spot=None):
+        """
+        Count completed passes: 1 pass is counted ONLY when 2 DIFFERENT players
+        on the SAME team successfully pass/transfer ball control to each other.
+        Uses a robust state machine requiring:
+        1. Confirmed passer control (>= 3 consecutive frames)
+        2. Confirmed receiver control (>= 3 consecutive frames by a different teammate)
+        3. Minimum spatial separation (>= 35px)
+        4. Maximum transit timeout (<= 90 frames)
+        """
+        bc = self._ball_center(tracks_frame)
+        if bc is None:
+            # Transit timeout check when ball is not detected
+            if self._passer_id is not None and (frame_idx - self._passer_confirmed_frame > self._PASS_MAX_TRANSIT_FRAMES):
+                self._passer_id = None
+                self._passer_team = None
+                self._passer_pos = None
+                self._pass_candidate_id = None
+                self._pass_candidate_frames = 0
+            return
 
-        # Rising edge: was inactive → now active
-        if pass_active and not self._prev_pass_active:
-            bc = self._ball_center(tracks_frame)
-            if bc is not None:
-                _, team, _ = self._nearest_player(tracks_frame, bc)
-                if team in (1, 2):
-                    self.pass_counts[team] += 1
+        pid, team, dist = self._nearest_player(tracks_frame, bc, use_feet=True)
+        players = tracks_frame.get("players") or {}
+        player_info = players.get(pid)
 
-        self._prev_pass_active = pass_active
+        in_control = (
+            team in (1, 2)
+            and player_info is not None
+            and dist <= self._control_radius(player_info)
+        )
+
+        if not in_control:
+            # Ball is loose / unpossessed in this frame
+            self._pass_candidate_id = None
+            self._pass_candidate_frames = 0
+            # Check transit timeout
+            if self._passer_id is not None and (frame_idx - self._passer_confirmed_frame > self._PASS_MAX_TRANSIT_FRAMES):
+                self._passer_id = None
+                self._passer_team = None
+                self._passer_pos = None
+            return
+
+        # Player `pid` of `team` is in control of the ball in this frame
+        player_feet = get_foot_position(player_info["bbox"])
+
+        # Track candidate control streak
+        if pid == self._pass_candidate_id:
+            self._pass_candidate_frames += 1
+        else:
+            self._pass_candidate_id = pid
+            self._pass_candidate_frames = 1
+
+        # Case 1: No confirmed passer yet -> accumulate frames until confirmed
+        if self._passer_id is None:
+            if self._pass_candidate_frames >= self._PASS_MIN_CONTROL_FRAMES:
+                self._passer_id = pid
+                self._passer_team = team
+                self._passer_pos = player_feet
+                self._passer_confirmed_frame = frame_idx
+                self.last_ball_possessor_id = pid
+                self.last_ball_possessor_team = team
+            return
+
+        # Case 2: Ball controlled by the SAME confirmed passer -> update position & frame timestamp
+        if pid == self._passer_id:
+            self._passer_pos = player_feet
+            self._passer_confirmed_frame = frame_idx
+            self.last_ball_possessor_id = pid
+            self.last_ball_possessor_team = team
+            return
+
+        # Case 3: Ball controlled by a DIFFERENT player `pid`
+        # Check if candidate has reached required control frames
+        if self._pass_candidate_frames >= self._PASS_MIN_CONTROL_FRAMES:
+            # Check if different player is on the SAME TEAM
+            if team == self._passer_team:
+                transit_frames = frame_idx - self._passer_confirmed_frame
+                spatial_dist = ((player_feet[0] - self._passer_pos[0]) ** 2 +
+                                (player_feet[1] - self._passer_pos[1]) ** 2) ** 0.5
+
+                if transit_frames <= self._PASS_MAX_TRANSIT_FRAMES and spatial_dist >= self._PASS_MIN_DISTANCE:
+                    if frame_idx - self.last_pass_completed_frame >= 6:
+                        self.pass_counts[team] += 1
+                        self.last_pass_completed_frame = frame_idx
+
+            # Update passer to the new confirmed possessor
+            self._passer_id = pid
+            self._passer_team = team
+            self._passer_pos = player_feet
+            self._passer_confirmed_frame = frame_idx
+            self.last_ball_possessor_id = pid
+            self.last_ball_possessor_team = team
 
     # ═══════ 3. SPEED ════════════════════════════════════════════
     def update_speed(self, tracks_frame, cam_calib, frame_w, frame_h,

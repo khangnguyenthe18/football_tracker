@@ -74,13 +74,14 @@ def main():
         # Gán team & màu + calibrate feet
         feets, colors = [], []
         for pid, info in cur_tracks['players'].items():
-            team = team_assigner.get_player_team(frame, info['bbox'], pid)
-            info['team'] = team
-            info['team_color'] = team_assigner.team_colors.get(team, (0, 0, 255))
             x1, y1, x2, y2 = info["bbox"]
             x1_n, y1_n, x2_n, y2_n = x1 / w, y1 / h, x2 / w, y2 / h
+            world_pos = cam_calib.get_world_feet((x1_n, y1_n, x2_n, y2_n))
+            team = team_assigner.get_player_team(frame, info['bbox'], pid, world_pos=world_pos)
+            info['team'] = team
+            info['team_color'] = team_assigner.team_colors.get(team, (0, 0, 255))
             try:
-                feet = cam_calib.calibrate_player_feet((x1_n, y1_n, x2_n, y2_n))
+                feet = cam_calib.calibrate_player_feet((x1_n, y1_n, x2_n, y2_n), player_id=pid)
                 if feet is not None:
                     feets.append(feet)
                     colors.append(info['team_color'])

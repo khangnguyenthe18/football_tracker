@@ -15,12 +15,17 @@ class TeamAssigner:
     FOREGROUND_PERCENTILE = 60
     MIN_TEAM_COLOR_DISTANCE = 12.0
 
-    def __init__(self):
+    def __init__(self, team_overrides=None):
         self.team_colors = {}          
         self.player_team_dict = {}    
+        self.team_overrides = team_overrides if team_overrides is not None else {}
         self.kmeans = None
         self._frame_count = defaultdict(int)    # pid → frames since last eval
         self._team_votes = defaultdict(lambda: deque(maxlen=TeamAssigner.VOTE_HISTORY))
+
+        # Spatial tracking for dynamic goalkeeper classification
+        self._player_world_x = defaultdict(lambda: deque(maxlen=30))  # pid -> recent world X (metres)
+        self._team_world_x = defaultdict(lambda: deque(maxlen=100))   # team_id -> recent field player world X
 
     @staticmethod
     def _boost_color(bgr):
@@ -115,7 +120,9 @@ class TeamAssigner:
 
     def assign_team_color(self, frame, player_detections):
         player_colors = []
-        for _, det in player_detections.items():
+        for pid, det in player_detections.items():
+            if pid in self.team_overrides:
+                continue
             bbox = det.get("bbox")
             if bbox is None:
                 continue
@@ -154,11 +161,49 @@ class TeamAssigner:
             representative = np.median(cluster_colors, axis=0)
             self.team_colors[label + 1] = self._boost_color(representative)
 
-    def get_player_team(self, frame, player_bbox, player_id):
+    def get_player_team(self, frame, player_bbox, player_id, world_pos=None):
+        # 1. Check explicit manual overrides
+        if player_id in self.team_overrides:
+            return self.team_overrides[player_id]
+
+        # Register spatial position if provided
+        if world_pos is not None:
+            self._player_world_x[player_id].append(world_pos[0])
+
+        # 2. Dynamic Spatial + Color Outlier Goalkeeper Classification
+        if player_id in self._player_world_x and len(self._player_world_x[player_id]) > 0:
+            avg_x = sum(self._player_world_x[player_id]) / len(self._player_world_x[player_id])
+            
+            # Goal Area threshold: player is standing near left/right goal line (|X| >= 28.0m)
+            if abs(avg_x) >= 28.0:
+                # Determine team side orientation from field players
+                t1_pts = list(self._team_world_x[1])
+                t2_pts = list(self._team_world_x[2])
+                t1_avg = sum(t1_pts) / len(t1_pts) if t1_pts else 1.0
+                t2_avg = sum(t2_pts) / len(t2_pts) if t2_pts else -1.0
+
+                if t1_avg > t2_avg:
+                    gk_team = 1 if avg_x > 0 else 2
+                else:
+                    gk_team = 1 if avg_x < 0 else 2
+
+                if self.kmeans is not None:
+                    color = self.get_player_color(frame, player_bbox)
+                    if color is not None:
+                        lab = self._to_lab(color)
+                        d1 = np.linalg.norm(lab - self.kmeans.cluster_centers_[0])
+                        d2 = np.linalg.norm(lab - self.kmeans.cluster_centers_[1])
+                        if min(d1, d2) >= 15.0 or abs(avg_x) >= 30.0:
+                            self.player_team_dict[player_id] = gk_team
+                            return gk_team
+                elif abs(avg_x) >= 30.0:
+                    self.player_team_dict[player_id] = gk_team
+                    return gk_team
+
         if self.kmeans is None:
             return None
 
-        # Check if we need to re-evaluate (periodic or first time)
+        # 3. K-Means field player classification
         self._frame_count[player_id] += 1
         needs_eval = (player_id not in self.player_team_dict or
                       self._frame_count[player_id] >= self.REEVAL_INTERVAL)
@@ -171,7 +216,6 @@ class TeamAssigner:
                     self._to_lab(color).reshape(1, -1))[0]) + 1
                 self._team_votes[player_id].append(team_id)
 
-                # Majority vote from recent observations
                 votes = list(self._team_votes[player_id])
                 counts = {vote: votes.count(vote) for vote in set(votes)}
                 max_count = max(counts.values())
@@ -181,4 +225,9 @@ class TeamAssigner:
                 )
                 self.player_team_dict[player_id] = majority
 
-        return self.player_team_dict.get(player_id)
+        team = self.player_team_dict.get(player_id)
+        if team in (1, 2) and player_id in self._player_world_x and len(self._player_world_x[player_id]) > 0:
+            avg_x = sum(self._player_world_x[player_id]) / len(self._player_world_x[player_id])
+            self._team_world_x[team].append(avg_x)
+
+        return team

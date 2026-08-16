@@ -48,6 +48,10 @@ class CamCalib:
         )
 
         self.H = None
+        self.H_inv = None
+        self._smooth_alpha = 0.12  # EMA factor for valid homographies (lower = smoother)
+        self._jump_thresh = 0.35   # Threshold for outlier rejection
+        self.player_minimap_pos = {}  # Smoothed positions per player ID
 
     def __call__(self, img):
         to_tensor = T.ToTensor()
@@ -57,10 +61,42 @@ class CamCalib:
         cam = self.calibrator(pred)
         
         if cam is not None:
-            self.H = cam.calibration @ cam.rotation @ np.concatenate((np.eye(3)[:, :2], -cam.position.reshape(3, 1)), axis=1)
+            H_new = cam.calibration @ cam.rotation @ np.concatenate((np.eye(3)[:, :2], -cam.position.reshape(3, 1)), axis=1)
 
-    def calibrate_player_feet(self, xyxyn):
-        if self.H is None:
+            # Normalize H_new to canonical form (H[2,2] == 1.0)
+            if abs(H_new[2, 2]) > 1e-6:
+                H_new = H_new / H_new[2, 2]
+
+            try:
+                H_inv_new = np.linalg.inv(H_new)
+                if abs(H_inv_new[2, 2]) > 1e-6:
+                    H_inv_new = H_inv_new / H_inv_new[2, 2]
+            except np.linalg.LinAlgError:
+                return
+
+            if self.H_inv is None:
+                self.H = H_new
+                self.H_inv = H_inv_new
+            else:
+                # Compute relative matrix distance in canonical H_inv space
+                diff = np.linalg.norm(H_inv_new - self.H_inv) / max(np.linalg.norm(self.H_inv), 1e-6)
+
+                if diff > self._jump_thresh:
+                    # Outlier detected! Reject H_inv_new completely to prevent minimap jerking
+                    pass
+                else:
+                    # Apply smooth EMA update on H_inv
+                    self.H_inv = self._smooth_alpha * H_inv_new + (1 - self._smooth_alpha) * self.H_inv
+                    self.H_inv = self.H_inv / self.H_inv[2, 2]
+                    try:
+                        self.H = np.linalg.inv(self.H_inv)
+                        self.H = self.H / self.H[2, 2]
+                    except np.linalg.LinAlgError:
+                        pass
+
+    def get_world_feet(self, xyxyn):
+        """Return (world_x, world_y) in meters from normalized bounding box, or None if invalid."""
+        if self.H_inv is None:
             return None
 
         x1, y1, x2, y2 = xyxyn
@@ -68,13 +104,41 @@ class CamCalib:
         y1 *= self.IMG_H
         x2 *= self.IMG_W
         y2 *= self.IMG_H
-        point2D = np.array([x1 + (x2 - x1) / 2, y2, 1])
+        point2D = np.array([x1 + (x2 - x1) / 2, y2, 1.0])
+
+        feet = self.H_inv @ point2D
+        if abs(feet[2]) < 1e-6:
+            return None
+        feet = feet / feet[2]
+
+        half_len = self.PITCH_LENGTH / 2.0
+        half_wid = self.PITCH_WIDTH / 2.0
+        margin = 15.0
+        if not (-(half_len + margin) <= feet[0] <= (half_len + margin) and
+                -(half_wid + margin) <= feet[1] <= (half_wid + margin)):
+            return None
+
+        return (float(feet[0]), float(feet[1]))
+
+    def calibrate_player_feet(self, xyxyn, player_id=None):
+        world_pos = self.get_world_feet(xyxyn)
+        if world_pos is None:
+            return None
 
         top_view_h = np.array([[self.f, 0, self.IMG_W/2], [0, self.f, self.IMG_H/2], [0, 0, 1]])
-        
-        feet = unproject_image_point(self.H, point2D=point2D)
-        imaged_feets = top_view_h @ np.array([feet[0], feet[1], 1])
+        imaged_feets = top_view_h @ np.array([world_pos[0], world_pos[1], 1.0])
         imaged_feets /= imaged_feets[2]
+
+        # Apply per-player 2D position smoothing if player_id is provided
+        pos = np.array([imaged_feets[0], imaged_feets[1]])
+        if player_id is not None:
+            if player_id in self.player_minimap_pos:
+                prev_pos = self.player_minimap_pos[player_id]
+                smoothed_pos = 0.45 * pos + 0.55 * prev_pos
+                self.player_minimap_pos[player_id] = smoothed_pos
+                return np.array([smoothed_pos[0], smoothed_pos[1], 1.0])
+            else:
+                self.player_minimap_pos[player_id] = pos
 
         return imaged_feets
 
